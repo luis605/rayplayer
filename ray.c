@@ -40,7 +40,6 @@ bool pq_empty() {
 }
 
 void pq_put(AVPacket packet) {
-    printf("putting...\n");
     pthread_mutex_lock(&pq.mutex);
     AVList *node = malloc(sizeof(AVList));
     node->self   = packet;
@@ -58,7 +57,6 @@ void pq_put(AVPacket packet) {
 }
 
 AVPacket pq_get() {
-    printf("getting...\n");
     pthread_mutex_lock(&pq.mutex);
     while (pq_empty()) {
         pthread_cond_wait(&pq.cond, &pq.mutex);
@@ -131,7 +129,6 @@ void audio_callback(void *buffer, unsigned int frames) {
     int                 len             = frames * sizeof(float) * 2;  // Stereo
     static int          jj              = 0;
     ++jj;
-    printf("AFrame: %d, %d\n", jj, pq.size);
     while (len > 0) {
         if (audio_buf_index >= audio_buf_size) {
             audio_size = audio_decode_frame(audio_buf);
@@ -156,6 +153,22 @@ void audio_callback(void *buffer, unsigned int frames) {
         dbuf += len1;
         audio_buf_index += len1;
     }
+}
+
+void ProcessVideoFrame(AVCodecContext *videoCodecCtx, AVFrame *frame, struct SwsContext *sws_ctx, AVFrame *pRGBFrame, Texture2D texture) {
+    int ret = avcodec_receive_frame(videoCodecCtx, frame);
+    if (ret >= 0) {
+        sws_scale(sws_ctx, (uint8_t const *const *)frame->data, frame->linesize, 0,
+                  frame->height, pRGBFrame->data, pRGBFrame->linesize);
+        UpdateTexture(texture, pRGBFrame->data[0]);
+    } else if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+        printf("Error receiving frame\n");
+    }
+}
+
+void ProcessAudioFrame(AVPacket *packet) {
+    AVPacket *cloned = av_packet_clone(packet);
+    pq_put(*cloned);
 }
 
 int main(int argc, char **argv) {
@@ -260,49 +273,64 @@ int main(int argc, char **argv) {
     pRGBFrame->height = videoCodecCtx->height;
     av_frame_get_buffer(pRGBFrame, 0);
     int vframe = 0;
+
+
     while (!WindowShouldClose()) {
         vframe++;
-        printf("VFrame %d\n", vframe);
-        while (av_read_frame(pFormatCtx, packet) >= 0) {
-            if (packet->stream_index == videoStream->index) {
-                printf("Video frame\n");
-                // Getting frame from video
+
+        int videoStreamIndex = videoStream->index;
+        int audioStreamIndex = audioStream->index;
+
+        int readFrameResult = av_read_frame(pFormatCtx, packet);
+        if (readFrameResult < 0) {
+            if (readFrameResult == AVERROR_EOF) {
+                // End of file reached, seek back to the beginning of the video stream
+                av_seek_frame(pFormatCtx, videoStreamIndex, 0, AVSEEK_FLAG_FRAME);
+                continue;
+            } else {
+                printf("Error reading frame: %s\n", av_err2str(readFrameResult));
+                break;
+            }
+        }
+
+        while (readFrameResult >= 0) {
+            if (packet->stream_index == videoStreamIndex) {
                 int ret = avcodec_send_packet(videoCodecCtx, packet);
                 av_packet_unref(packet);
-                if (ret < 0) {
-                    // Error
-                    printf("Error sending packet\n");
-                    continue;
-                }
-                while (ret >= 0) {
-                    ret = avcodec_receive_frame(videoCodecCtx, frame);
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                        break;
+
+                if (ret >= 0) {
+                    while (ret >= 0) {
+                        ProcessVideoFrame(videoCodecCtx, frame, sws_ctx, pRGBFrame, texture);
+                        ret = avcodec_receive_frame(videoCodecCtx, frame);
                     }
-                    sws_scale(sws_ctx, (uint8_t const *const *)frame->data, frame->linesize, 0,
-                              frame->height, pRGBFrame->data, pRGBFrame->linesize);
-                    UpdateTexture(texture, pRGBFrame->data[0]);
+                } else {
+                    printf("Error sending packet\n");
                 }
+
                 break;
-            } else if (packet->stream_index == audioStream->index) {
-                // Getting audio data from audio
-                printf("Audio frame\n");
-                AVPacket *cloned = av_packet_clone(packet);
-                pq_put(*cloned);
+            } else if (packet->stream_index == audioStreamIndex) {
+                ProcessAudioFrame(packet);
+                av_packet_unref(packet);
+            } else {
+                av_packet_unref(packet);
             }
-            av_packet_unref(packet);
+
+            readFrameResult = av_read_frame(pFormatCtx, packet);
         }
+
 
         BeginDrawing();
         ClearBackground(WHITE);
 
         DrawTexturePro(texture, (Rectangle){0, 0, texture.width, texture.height},
-                       (Rectangle){0, 0, screenWidth, screenHeight}, (Vector2){0, 0}, 0, WHITE);
+                    (Rectangle){0, 0, screenWidth, screenHeight}, (Vector2){0, 0}, 0, WHITE);
 
         DrawFPS(0, 0);
 
         EndDrawing();
     }
+
+
     UnloadTexture(texture);
     UnloadAudioStream(rayAStream);
 
